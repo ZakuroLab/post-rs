@@ -13,3 +13,8 @@ regex = "1.10.4"
 [dev-dependencies]
 post-rs = { path = "../" }
 rstest = "0.21.0"
+
+[dependencies.spacemesh-cuda]
+git = "https://github.com/ZakuroLab/spacemesh-cuda.git"
+rev = "c86afcc"
+version = "0.0.1"

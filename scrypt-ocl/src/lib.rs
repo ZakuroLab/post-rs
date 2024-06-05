@@ -1,31 +1,27 @@
 use ocl::{
     builders::ProgramBuilder,
     enums::{DeviceInfo, DeviceInfoResult, KernelWorkGroupInfo, KernelWorkGroupInfoResult},
-    Buffer, Context, Device, DeviceType, Event, Kernel, MemFlags, Platform, ProQue, Queue,
-    SpatialDims,
+    ffi::libc::raise,
+    Buffer, Device, DeviceType, Kernel, MemFlags, Platform, ProQue, SpatialDims,
 };
-use post::initialize::{Initialize, VrfNonce, ENTIRE_LABEL_SIZE, LABEL_SIZE};
-use std::{
-    cmp::min,
-    fmt::Display,
-    io::Write,
-    ops::Range,
-    time::{Duration, Instant},
+use post::{
+    initialize::{Initialize, VrfNonce, ENTIRE_LABEL_SIZE, LABEL_SIZE},
+    pow::Prover,
 };
+use std::{cmp::min, fmt::Display, io::Write, ops::Range};
 use thiserror::Error;
 
 pub use ocl;
+
+use spacemesh_cuda;
 
 mod filtering;
 
 #[derive(Debug)]
 struct Scrypter {
-    kernel: Kernel,
-    input: Buffer<u32>,
-    output: Buffer<u8>,
-    global_work_size: usize,
-    preferred_wg_size_mult: usize,
     labels_buffer: Vec<u8>,
+    N: u32,
+    device_id: u32,
 }
 
 #[derive(Error, Debug)]
@@ -61,20 +57,13 @@ macro_rules! cast {
 pub struct ProviderId(pub u32);
 
 pub struct Provider {
-    pub platform: Platform,
-    pub device: Device,
     pub class: DeviceType,
+    pub device_id: u32,
 }
 
 impl Display for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[{:?}] {}/{}",
-            self.class,
-            self.platform.name().unwrap_or("unknown".to_owned()),
-            self.device.name().unwrap_or("unknown".to_owned())
-        )
+        write!(f, "[{:?}] device_id: {}", self.class, self.device_id)
     }
 }
 
@@ -89,31 +78,22 @@ pub fn get_providers_count(device_types: Option<DeviceType>) -> usize {
 }
 
 pub fn get_providers(device_types: Option<DeviceType>) -> Result<Vec<Provider>, ScryptError> {
-    let list_core = ocl::core::get_platform_ids()?;
-    let platforms = Platform::list_from_core(list_core);
+    let device_types = device_types.or(Some(DeviceType::GPU)).unwrap();
 
-    let platform_filter = filtering::create_platform_filter();
-    let device_filter = filtering::create_device_filter();
-
-    let platforms_filtered = platforms
-        .into_iter()
-        .filter(|p| p.name().map(|n| platform_filter(&n)).unwrap_or(false));
-
-    let mut providers = Vec::new();
-    for platform in platforms_filtered {
-        let devices = Device::list(platform, device_types)?;
-        for device in devices
-            .into_iter()
-            .filter(|d| d.name().map(|n| device_filter(&n)).unwrap_or(false))
-        {
-            providers.push(Provider {
-                platform,
-                device,
-                class: cast!(device.info(DeviceInfo::Type)?, DeviceInfoResult::Type),
-            });
-        }
+    if !device_types.contains(DeviceType::GPU) {
+        panic!("only support gpu device type");
     }
 
+    let device_num = spacemesh_cuda::get_device_num();
+
+    let mut providers = Vec::new();
+
+    for t in 0..device_num {
+        providers.push(Provider {
+            class: DeviceType::GPU,
+            device_id: t,
+        })
+    }
     Ok(providers)
 }
 
@@ -132,128 +112,13 @@ fn scan_for_vrf_nonce(labels: &[u8], mut difficulty: [u8; 32]) -> Option<VrfNonc
 }
 
 impl Scrypter {
-    pub fn new(platform: Platform, device: Device, n: usize) -> Result<Self, ScryptError> {
-        // Calculate kernel memory requirements
-        const LOOKUP_GAP: usize = 2;
-        const SCRYPT_MEM: usize = 128;
-        const INPUT_SIZE: usize = 32;
-
-        let kernel_lookup_mem_size = n / LOOKUP_GAP * SCRYPT_MEM;
-        let kernel_output_mem_size = ENTIRE_LABEL_SIZE;
-        let kernel_memory = kernel_lookup_mem_size + kernel_output_mem_size;
-
-        // Query device parameters
-        let device_memory = cast!(
-            device.info(DeviceInfo::GlobalMemSize)?,
-            DeviceInfoResult::GlobalMemSize
-        );
-        let max_mem_alloc_size = cast!(
-            device.info(DeviceInfo::MaxMemAllocSize)?,
-            DeviceInfoResult::MaxMemAllocSize
-        );
-        let max_compute_units = cast!(
-            device.info(DeviceInfo::MaxComputeUnits)?,
-            DeviceInfoResult::MaxComputeUnits
-        );
-        let max_wg_size = device.max_wg_size()?;
-        log::info!(
-            "device memory: {} MB, max_mem_alloc_size: {} MB, max_compute_units: {max_compute_units}, max_wg_size: {max_wg_size}",
-            device_memory / 1024 / 1024,
-            max_mem_alloc_size / 1024 / 1024,
-        );
-
-        let context = Context::builder()
-            .platform(platform)
-            .devices(device)
-            .build()?;
-
-        let src = include_str!("scrypt-jane.cl");
-        let program_builder = ProgramBuilder::new()
-            .source(src)
-            .cmplr_def("LOOKUP_GAP", LOOKUP_GAP as i32)
-            .clone();
-
-        let read_queue = Queue::new(&context, device, None)?;
-        let pro_que = ProQue::builder()
-            .context(context)
-            .device(device)
-            .prog_bldr(program_builder)
-            .dims(1)
-            .build()?;
-
-        let mut kernel = pro_que
-            .kernel_builder("scrypt")
-            .arg(n as u32)
-            .arg(0u64)
-            .arg(pro_que.buffer_builder::<u32>().build()?)
-            .arg(pro_que.buffer_builder::<u8>().build()?)
-            .arg(pro_que.buffer_builder::<u32>().build()?)
-            .build()?;
-
-        let preferred_wg_size_mult = cast!(
-            kernel.wg_info(device, KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple)?,
-            KernelWorkGroupInfoResult::PreferredWorkGroupSizeMultiple
-        );
-        let kernel_wg_size = kernel.wg_info(device, KernelWorkGroupInfo::WorkGroupSize)?;
-
-        log::info!("preferred_wg_size_multiple: {preferred_wg_size_mult}, kernel_wg_size: {kernel_wg_size}");
-
-        let max_global_work_size_based_on_total_mem =
-            ((device_memory - INPUT_SIZE as u64) / kernel_memory as u64) as usize;
-        let max_global_work_size_based_on_max_mem_alloc_size =
-            (max_mem_alloc_size / kernel_lookup_mem_size as u64) as usize;
-        let max_global_work_size = min(
-            max_global_work_size_based_on_max_mem_alloc_size,
-            max_global_work_size_based_on_total_mem,
-        );
-        let local_work_size = preferred_wg_size_mult;
-        // Round down to nearest multiple of local_work_size
-        let global_work_size = (max_global_work_size / local_work_size) * local_work_size;
-        log::info!(
-            "Using: global_work_size: {global_work_size}, local_work_size: {local_work_size}"
-        );
-
-        log::info!("Allocating buffer for input: {INPUT_SIZE} bytes");
-        let input = Buffer::<u32>::builder()
-            .len(INPUT_SIZE / 4)
-            .flags(MemFlags::new().read_only().host_write_only())
-            .queue(pro_que.queue().clone())
-            .build()?;
-
-        let output_size = global_work_size * ENTIRE_LABEL_SIZE;
-        log::info!("Allocating buffer for output: {output_size} bytes");
-        let output = Buffer::<u8>::builder()
-            .len(output_size)
-            .flags(
-                MemFlags::new()
-                    .alloc_host_ptr()
-                    .write_only()
-                    .host_read_only(),
-            )
-            .queue(read_queue)
-            .build()?;
-
-        let lookup_size = global_work_size * kernel_lookup_mem_size;
-        log::info!("Allocating buffer for lookup: {lookup_size} bytes");
-        let lookup_memory = Buffer::<u32>::builder()
-            .len(lookup_size / 4)
-            .flags(MemFlags::new().host_no_access())
-            .queue(pro_que.queue().clone())
-            .build()?;
-
-        kernel.set_arg(2, &input)?;
-        kernel.set_arg(3, &output)?;
-        kernel.set_arg(4, &lookup_memory)?;
-        kernel.set_default_global_work_size(SpatialDims::One(global_work_size));
-        kernel.set_default_local_work_size(SpatialDims::One(local_work_size));
-
+    pub fn new(n: usize, device_id: u32) -> Result<Self, ScryptError> {
+        // n = 8192
+        let max_task_num = spacemesh_cuda::get_max_task_num(device_id) as usize;
         Ok(Self {
-            kernel,
-            input,
-            output,
-            global_work_size,
-            preferred_wg_size_mult,
-            labels_buffer: vec![0u8; global_work_size * ENTIRE_LABEL_SIZE],
+            labels_buffer: vec![0u8; max_task_num * ENTIRE_LABEL_SIZE],
+            N: n as u32,
+            device_id,
         })
     }
 
@@ -268,75 +133,31 @@ impl Scrypter {
             .chunks(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        self.input.write(&commitment).enq()?;
+
+        // self.input.write(&commitment).enq()?;
+
+        let max_task_num = spacemesh_cuda::get_max_task_num(self.device_id) as usize;
 
         let mut best_nonce = None;
         let labels_end = labels.end;
+        let label_num = labels.end - labels.start;
+        if label_num % 32 != 0 {
+            panic!("the number of labels must be a multiple of 32");
+        }
 
-        let mut total_kernel_duration = Duration::ZERO;
-        let mut last_kernel_duration = Duration::ZERO;
-
-        for (iter, index) in labels.step_by(self.global_work_size).enumerate() {
-            self.kernel.set_arg(1, index)?;
-
-            let index_end = min(index + self.global_work_size as u64, labels_end);
+        for index in labels.step_by(max_task_num) {
+            let index_end = min(index + max_task_num as u64, labels_end);
             let labels_to_init = (index_end - index) as usize;
-
-            let gws = if labels_to_init < self.global_work_size {
-                // Round up labels_to_init to be a multiple of preferred_wg_size_mult
-                (labels_to_init + self.preferred_wg_size_mult - 1) / self.preferred_wg_size_mult
-                    * self.preferred_wg_size_mult
-            } else {
-                self.global_work_size
-            };
-            self.kernel
-                .set_default_global_work_size(SpatialDims::One(gws));
-
-            let mut kernel_event = Event::empty();
-            unsafe {
-                self.kernel.cmd().enew(&mut kernel_event).enq()?;
-            }
-
-            let read_start = Instant::now();
-            // On some platforms (eg. Nvidia), the read command will spin CPU 100% until the kernel finishes.
-            // Hence we wait a bit before reading the buffer.
-            // The wait time is based on the average kernel duration, with some margin.
-            // It's weighted 50% of last kernel duration and 50% of average kernel duration
-            // to speed up convergence to the optimal wait time.
-            //
-            // We skip few 'warmup iterations', as the average kernel duration is not yet reliable.
-            let warmup_iters = 10;
-            if iter > warmup_iters {
-                let average = total_kernel_duration.div_f32((iter - warmup_iters) as f32);
-                log::trace!("last execution time: {last_kernel_duration:?}, average: {average:?})");
-
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let wait = (last_kernel_duration + average).div_f32(2.0).mul_f32(0.9);
-                    // Don't wait longer than `average - 5ms` to give the scheduler time to switch back to this thread.
-                    let wait = min(
-                        average
-                            .checked_sub(Duration::from_millis(5))
-                            .unwrap_or_default(),
-                        wait,
-                    );
-                    log::trace!("waiting for kernel to finish for {wait:?}");
-                    std::thread::sleep(wait);
-                }
-            }
+            spacemesh_cuda::scrypt(
+                self.device_id,
+                index,
+                commitment.as_ref(),
+                labels_to_init as u32,
+                self.labels_buffer.as_mut(),
+            );
 
             let labels_buffer =
                 &mut self.labels_buffer.as_mut_slice()[..labels_to_init * ENTIRE_LABEL_SIZE];
-            self.output
-                .cmd()
-                .ewait(&kernel_event)
-                .read(labels_buffer.as_mut())
-                .enq()?;
-
-            if iter >= warmup_iters {
-                last_kernel_duration = read_start.elapsed();
-                total_kernel_duration += last_kernel_duration;
-            }
 
             // Look for VRF nonce if enabled
             // TODO: run in background / in parallel to GPU
@@ -388,11 +209,11 @@ impl OpenClInitializer {
         } else {
             providers.first().ok_or(ScryptError::NoProvidersAvailable)?
         };
-        let platform = provider.platform;
-        let device = provider.device;
+
+        let device_id = provider.device_id;
         log::info!("Using provider: {provider}");
 
-        let scrypter = Scrypter::new(platform, device, n)?;
+        let scrypter = Scrypter::new(n, device_id)?;
 
         Ok(Self { scrypter })
     }
@@ -438,50 +259,42 @@ mod tests {
 
     #[test]
     fn scrypting_1_label() {
-        let mut scrypter = OpenClInitializer::new(None, 8192, None).unwrap();
+        let mut scrypter = OpenClInitializer::new(Some(ProviderId(0)), 8192, None).unwrap();
         let mut labels = Vec::new();
         scrypter
-            .initialize_to(&mut labels, &[0u8; 32], 0..1, None)
+            .initialize_to(&mut labels, &[8u8; 32], 0..32 * 3, None)
             .unwrap();
 
-        let mut expected = Vec::with_capacity(1);
+        let mut expected = Vec::with_capacity(32);
         CpuInitializer::new(ScryptParams::new(8192, 1, 1))
-            .initialize_to(&mut expected, &[0u8; 32], 0..1, None)
+            .initialize_to(&mut expected, &[8u8; 32], 0..32 * 3, None)
             .unwrap();
 
         assert_eq!(expected, labels);
     }
 
     #[rstest]
-    #[case(512)]
-    #[case(1024)]
-    #[case(2048)]
-    #[case(4096)]
     #[case(8192)]
     fn scrypting_from_0(#[case] n: usize) {
-        let indices = 0..4000;
+        let indices = 0..(1024 * 64);
 
         let mut scrypter = OpenClInitializer::new(None, n, None).unwrap();
         let mut labels = Vec::new();
         scrypter
-            .initialize_to(&mut labels, &[0u8; 32], indices.clone(), None)
+            .initialize_to(&mut labels, &[3u8; 32], indices.clone(), None)
             .unwrap();
 
         let mut expected =
             Vec::<u8>::with_capacity(usize::try_from(indices.end - indices.start).unwrap());
 
         CpuInitializer::new(ScryptParams::new(n, 1, 1))
-            .initialize_to(&mut expected, &[0u8; 32], indices, None)
+            .initialize_to(&mut expected, &[3u8; 32], indices, None)
             .unwrap();
 
         assert_eq!(expected, labels);
     }
 
     #[rstest]
-    #[case(512)]
-    #[case(1024)]
-    #[case(2048)]
-    #[case(4096)]
     #[case(8192)]
     fn scrypting_over_4gb(#[case] n: usize) {
         let indices = u32::MAX as u64 - 1000..u32::MAX as u64 + 1000;
@@ -504,7 +317,7 @@ mod tests {
 
     #[test]
     fn scrypting_with_commitment() {
-        let indices = 0..1000;
+        let indices = 11..(32 * 3) + 11;
         let commitment = b"this is some commitment for init";
 
         let mut scrypter = OpenClInitializer::new(None, 8192, None).unwrap();
@@ -524,10 +337,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case(512)]
-    #[case(1024)]
-    #[case(2048)]
-    #[case(4096)]
     #[case(8192)]
     fn searching_for_vrf_nonce(#[case] n: usize) {
         let indices = 0..6000;
@@ -559,36 +368,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(cpu_nonce, opencl_nonce);
-    }
-
-    #[test]
-    fn initialize_in_batches() {
-        const N: usize = 512;
-
-        let mut initializer = OpenClInitializer::new(None, N, None).unwrap();
-        let gws = initializer.scrypter.global_work_size as u64;
-
-        let mut labels = Vec::<u8>::new();
-
-        // Initialize 2 GWS in two batches, first smaller then the second
-        let indices = 0..2 * gws;
-        let smaller_batch = gws / 3;
-
-        initializer
-            .initialize_to(&mut labels, &[0u8; 32], indices.start..smaller_batch, None)
-            .unwrap();
-        initializer
-            .initialize_to(&mut labels, &[0u8; 32], smaller_batch..indices.end, None)
-            .unwrap();
-
-        let mut expected =
-            Vec::<u8>::with_capacity(usize::try_from(indices.end - indices.start).unwrap());
-
-        CpuInitializer::new(ScryptParams::new(N, 1, 1))
-            .initialize_to(&mut expected, &[0u8; 32], indices, None)
-            .unwrap();
-
-        assert_eq!(expected.len(), labels.len());
-        assert_eq!(expected, labels);
     }
 }
