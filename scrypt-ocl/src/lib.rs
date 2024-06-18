@@ -1,12 +1,6 @@
-use ocl::{
-    builders::ProgramBuilder,
-    enums::{DeviceInfo, DeviceInfoResult, KernelWorkGroupInfo, KernelWorkGroupInfoResult},
-    ffi::libc::raise,
-    Buffer, Device, DeviceType, Kernel, MemFlags, Platform, ProQue, SpatialDims,
-};
+use ocl::DeviceType;
 use post::{
     initialize::{Initialize, VrfNonce, ENTIRE_LABEL_SIZE, LABEL_SIZE},
-    pow::Prover,
 };
 use std::{cmp::min, fmt::Display, io::Write, ops::Range};
 use thiserror::Error;
@@ -154,7 +148,7 @@ impl Scrypter {
                 commitment.as_ref(),
                 labels_to_init as u32,
                 self.labels_buffer.as_mut(),
-            );
+            ).expect("Failed to execute the scrypt process");
 
             let labels_buffer =
                 &mut self.labels_buffer.as_mut_slice()[..labels_to_init * ENTIRE_LABEL_SIZE];

@@ -16,5 +16,5 @@ rstest = "0.21.0"
 
 [dependencies.spacemesh-cuda]
 git = "https://github.com/ZakuroLab/spacemesh-cuda.git"
-rev = "c86afcc"
+rev = "7910031510ef2a7c1a7e7bcfe96d0e38ea921866"
 version = "0.0.1"
